@@ -17,7 +17,7 @@ const COLLECTION_SIZE = 8888; // token IDs 0–8887
 // First trait "mode" button. Overridable via env in case your loaded metadata
 // uses different exact trait naming (matching is case-insensitive either way).
 const BOWLCUT_TRAIT = process.env.BOWLCUT_TRAIT_TYPE || 'Head';
-const BOWLCUT_VALUE = process.env.BOWLCUT_TRAIT_VALUE || 'Bowlcut';
+const BOWLCUT_VALUE = process.env.BOWLCUT_TRAIT_VALUE || 'Bowl Cut';
 
 // ---------- DB ----------
 const db = new Database(process.env.DB_PATH || 'faceoff.db');
