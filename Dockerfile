@@ -10,8 +10,6 @@ RUN npm install --omit=dev
 
 COPY . .
 
-# Persist the DB outside the container layer
-VOLUME ["/app/data"]
 ENV DB_PATH=/app/data/faceoff.db
 
 CMD ["node", "index.js"]
