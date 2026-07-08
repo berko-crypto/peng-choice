@@ -7,7 +7,7 @@ const {
   AttachmentBuilder, PermissionFlagsBits,
 } = require('discord.js');
 const Database = require('better-sqlite3');
-const { getImageUrl } = require('./lib/pudgyImages');
+const { getImageUrl, fetchTokenMetadata } = require('./lib/pudgyImages');
 const { buildMatchupImage } = require('./lib/composite');
 
 const TOKEN = process.env.DISCORD_TOKEN;
@@ -139,6 +139,53 @@ function parseTraitsFile(text, ext) {
   return rows;
 }
 
+// ---------- Bulk on-chain trait fetch (one-time, admin-triggered) ----------
+let bulkFetchRunning = false;
+
+async function bulkFetchTraits(onProgress) {
+  if (bulkFetchRunning) throw new Error('A fetch is already in progress.');
+  bulkFetchRunning = true;
+  const CONCURRENCY = 15;
+  let done = 0, ok = 0, failed = 0;
+  const ids = Array.from({ length: COLLECTION_SIZE }, (_, i) => i);
+
+  try {
+    async function worker(queue) {
+      for (const tokenId of queue) {
+        try {
+          const meta = await fetchTokenMetadata(tokenId);
+          const attrs = meta.attributes ?? [];
+          const tx = db.transaction(() => {
+            for (const a of attrs) {
+              if (a.trait_type == null || a.value == null) continue;
+              insertTrait.run(tokenId, String(a.trait_type), String(a.value));
+            }
+          });
+          tx();
+          ok++;
+        } catch (err) {
+          failed++;
+          if (failed <= 20) console.error(`[fetchmetadata] token #${tokenId} failed: ${err.message}`);
+        }
+        done++;
+        if (done % 200 === 0) {
+          console.log(`[fetchmetadata] progress: ${done}/${COLLECTION_SIZE} (ok: ${ok}, failed: ${failed})`);
+          onProgress?.(done, ok, failed);
+        }
+      }
+    }
+    // Split the full ID range into CONCURRENCY interleaved slices so one slow
+    // worker doesn't block a big contiguous chunk from starting.
+    const workers = Array.from({ length: CONCURRENCY }, (_, w) =>
+      worker(ids.filter((_, i) => i % CONCURRENCY === w)));
+    await Promise.all(workers);
+    console.log(`[fetchmetadata] done. ok: ${ok}, failed: ${failed}`);
+    return { ok, failed };
+  } finally {
+    bulkFetchRunning = false;
+  }
+}
+
 // ---------- Bot ----------
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
@@ -162,6 +209,9 @@ const commands = [
   new SlashCommandBuilder().setName('loadtraits')
     .setDescription('Admin: load/update trait metadata from an attached .json or .csv file')
     .addAttachmentOption(o => o.setName('file').setDescription('metadata.json (attributes array) or .csv (token_id,trait_type,value)').setRequired(true))
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
+  new SlashCommandBuilder().setName('fetchmetadata')
+    .setDescription('Admin: pull trait data for all 8888 penguins on-chain (takes 10-20+ min, runs in background)')
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
 ].map(c => c.toJSON());
 
@@ -318,6 +368,24 @@ client.on('interactionCreate', async (interaction) => {
           console.error('[loadtraits] failed:', err);
           return interaction.editReply(`Failed to load traits: ${err.message}`);
         }
+      }
+      if (interaction.commandName === 'fetchmetadata') {
+        if (bulkFetchRunning) {
+          return interaction.reply({ content: 'A metadata fetch is already running — check server logs for progress.', flags: MessageFlags.Ephemeral });
+        }
+        await interaction.reply({
+          content: `Starting on-chain trait fetch for all **${COLLECTION_SIZE}** penguins. This can take **10-20+ minutes** and runs in the background — I'll edit this message when done if I'm still around, otherwise check server logs or just try the trait-filtered commands again in a bit.`,
+          flags: MessageFlags.Ephemeral,
+        });
+        bulkFetchTraits().then(({ ok, failed }) => {
+          interaction.editReply(`✅ Trait fetch complete. **${ok}** succeeded, **${failed}** failed. Trait modes are ready to use.`).catch(() => {
+            console.log(`[fetchmetadata] finished (ok: ${ok}, failed: ${failed}) — interaction window closed, see logs only.`);
+          });
+        }).catch(err => {
+          console.error('[fetchmetadata] fatal error:', err);
+          interaction.editReply(`❌ Trait fetch failed: ${err.message}`).catch(() => {});
+        });
+        return;
       }
     }
 
