@@ -4,7 +4,7 @@
 const {
   Client, GatewayIntentBits, SlashCommandBuilder, REST, Routes,
   EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, MessageFlags,
-  AttachmentBuilder,
+  AttachmentBuilder, PermissionFlagsBits,
 } = require('discord.js');
 const Database = require('better-sqlite3');
 const { getImageUrl } = require('./lib/pudgyImages');
@@ -39,7 +39,20 @@ db.exec(`
     PRIMARY KEY (token_id, trait_type)
   );
   CREATE INDEX IF NOT EXISTS idx_traits_lookup ON traits (trait_type, value);
+  CREATE TABLE IF NOT EXISTS featured_config (
+    guild_id TEXT PRIMARY KEY,
+    channel_id TEXT NOT NULL,
+    message_id TEXT
+  );
 `);
+
+const getFeaturedConfig = db.prepare('SELECT * FROM featured_config WHERE guild_id = ?');
+const setFeaturedConfig = db.prepare(`
+  INSERT INTO featured_config (guild_id, channel_id, message_id) VALUES (?, ?, NULL)
+  ON CONFLICT(guild_id) DO UPDATE SET channel_id = excluded.channel_id, message_id = NULL`);
+const setFeaturedMessageId = db.prepare(
+  'UPDATE featured_config SET message_id = ? WHERE guild_id = ?');
+const allFeaturedConfigs = db.prepare('SELECT * FROM featured_config');
 
 const traitTypes = db.prepare(
   `SELECT DISTINCT trait_type FROM traits ORDER BY trait_type`);
@@ -99,6 +112,10 @@ const commands = [
     .addStringOption(o => o.setName('value').setDescription('Filter by trait value').setAutocomplete(true).setRequired(false)),
   new SlashCommandBuilder().setName('mystats')
     .setDescription('Your voting stats'),
+  new SlashCommandBuilder().setName('setfeatured')
+    .setDescription('Admin: set the channel for the auto-refreshing Featured Matchup')
+    .addChannelOption(o => o.setName('channel').setDescription('Channel to post/refresh the featured matchup in').setRequired(true))
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
 ].map(c => c.toJSON());
 
 function randomPair(traitType, value) {
@@ -113,6 +130,19 @@ function randomPair(traitType, value) {
   const a = Math.floor(Math.random() * COLLECTION_SIZE);
   let b = Math.floor(Math.random() * COLLECTION_SIZE);
   while (b === a) b = Math.floor(Math.random() * COLLECTION_SIZE);
+  return [a, b];
+}
+
+// Random pair drawn from the current top-N leaderboard, for the featured matchup —
+// keeps it fresh (not always literally #1 vs #2) while still spotlighting favorites.
+const FEATURED_POOL_SIZE = 10;
+const FEATURED_MIN_MATCHUPS = 3;
+function topPair() {
+  const pool = topPenguins.all(FEATURED_MIN_MATCHUPS, FEATURED_POOL_SIZE).map(p => p.token_id);
+  if (pool.length < 2) return null;
+  const a = pool[Math.floor(Math.random() * pool.length)];
+  let b = pool[Math.floor(Math.random() * pool.length)];
+  while (b === a) b = pool[Math.floor(Math.random() * pool.length)];
   return [a, b];
 }
 
@@ -211,6 +241,12 @@ client.on('interactionCreate', async (interaction) => {
           flags: MessageFlags.Ephemeral,
         });
       }
+      if (interaction.commandName === 'setfeatured') {
+        const channel = interaction.options.getChannel('channel');
+        setFeaturedConfig.run(interaction.guildId, channel.id);
+        await interaction.reply({ content: `Featured Matchup will now post/refresh in <#${channel.id}>.`, flags: MessageFlags.Ephemeral });
+        return refreshFeatured(interaction.guildId); // post the first one immediately
+      }
     }
 
     if (interaction.isButton()) {
@@ -269,6 +305,46 @@ client.on('interactionCreate', async (interaction) => {
   }
 });
 
+// ---------- Featured Matchup (auto-refreshing) ----------
+async function refreshFeatured(guildId) {
+  const config = getFeaturedConfig.get(guildId);
+  if (!config) return;
+  const pair = topPair();
+  if (!pair) {
+    console.log(`[featured] guild ${guildId}: not enough qualified pengus yet, skipping refresh`);
+    return;
+  }
+  try {
+    const channel = await client.channels.fetch(config.channel_id);
+    const msg = await faceoffMessage(...pair);
+    msg.content = `🌟 **Featured Matchup — Top Contenders!** ${msg.content}`;
+
+    if (config.message_id) {
+      try {
+        const existing = await channel.messages.fetch(config.message_id);
+        await existing.edit({ ...msg, embeds: msg.embeds }); // full edit incl. new attachment
+        return;
+      } catch {
+        // Old message was deleted or otherwise unfetchable — fall through and post a new one.
+      }
+    }
+    const sent = await channel.send(msg);
+    setFeaturedMessageId.run(sent.id, guildId);
+  } catch (err) {
+    console.error(`[featured] refresh failed for guild ${guildId}:`, err);
+  }
+}
+
+function scheduleFeaturedRefresh() {
+  const minutes = Number(process.env.FEATURED_INTERVAL_MINUTES) || 60;
+  setInterval(() => {
+    for (const config of allFeaturedConfigs.all()) {
+      refreshFeatured(config.guild_id).catch(err => console.error('[featured] scheduled refresh error:', err));
+    }
+  }, minutes * 60 * 1000);
+  console.log(`[featured] auto-refresh scheduled every ${minutes} minute(s)`);
+}
+
 client.once('clientReady', async () => {
   const rest = new REST().setToken(TOKEN);
   const route = process.env.DISCORD_GUILD_ID
@@ -276,6 +352,7 @@ client.once('clientReady', async () => {
     : Routes.applicationCommands(CLIENT_ID);
   await rest.put(route, { body: commands });
   console.log(`Logged in as ${client.user.tag} — commands registered${process.env.DISCORD_GUILD_ID ? ' (guild-scoped, instant)' : ' (global, may take up to 1hr)'}.`);
+  scheduleFeaturedRefresh();
 });
 
 client.login(TOKEN);
