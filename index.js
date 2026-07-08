@@ -4,14 +4,15 @@
 const {
   Client, GatewayIntentBits, SlashCommandBuilder, REST, Routes,
   EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, MessageFlags,
+  AttachmentBuilder,
 } = require('discord.js');
 const Database = require('better-sqlite3');
+const { createImageCache } = require('./lib/pudgyImages');
+const { buildMatchupImage } = require('./lib/composite');
 
 const TOKEN = process.env.DISCORD_TOKEN;
 const CLIENT_ID = process.env.DISCORD_CLIENT_ID;
 const COLLECTION_SIZE = 8888; // token IDs 0–8887
-const IMAGE_URL = (id) =>
-  (process.env.PENGU_IMAGE_URL || 'https://api.pudgypenguins.io/penguin/image/{id}').replace('{id}', id);
 
 // ---------- DB ----------
 const db = new Database(process.env.DB_PATH || 'faceoff.db');
@@ -47,6 +48,7 @@ const traitValues = db.prepare(
 const tokensForTrait = db.prepare(
   `SELECT token_id FROM traits WHERE trait_type = ? AND value = ?`);
 const traitCount = db.prepare(`SELECT COUNT(*) AS n FROM traits`);
+const imageCache = createImageCache(db);
 
 const getPenguin = db.prepare('SELECT * FROM penguins WHERE token_id = ?');
 const upsertPenguin = db.prepare(`
@@ -115,15 +117,21 @@ function randomPair(traitType, value) {
   return [a, b];
 }
 
-function faceoffMessage(a, b, traitType, value) {
+async function faceoffMessage(a, b, traitType, value) {
   const mode = traitType && value ? `${traitType}=${value}` : '';
   const matchupId = `${a}v${b}-${Date.now().toString(36)}`;
-  const embeds = [
-    new EmbedBuilder().setTitle(`Pengu #${a}`).setURL('https://pudgypenguins.com')
-      .setImage(IMAGE_URL(a)).setColor(0x00A9E0),
-    new EmbedBuilder().setTitle(`Pengu #${b}`).setURL('https://pudgypenguins.com')
-      .setImage(IMAGE_URL(b)).setColor(0xFF7A00),
-  ];
+
+  const [urlA, urlB] = await Promise.all([imageCache.getImageUrl(a), imageCache.getImageUrl(b)]);
+  const imageBuffer = await buildMatchupImage(urlA, urlB);
+  const filename = `matchup-${matchupId}.png`;
+  const attachment = new AttachmentBuilder(imageBuffer, { name: filename });
+
+  const embed = new EmbedBuilder()
+    .setTitle(`Pengu #${a}  vs  Pengu #${b}`)
+    .setImage(`attachment://${filename}`)
+    .setColor(0x00A9E0)
+    .setFooter({ text: '0 votes' });
+
   const row = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId(`vote:${matchupId}:${a}:${b}`)
       .setLabel(`#${a}`).setStyle(ButtonStyle.Primary),
@@ -135,7 +143,7 @@ function faceoffMessage(a, b, traitType, value) {
   const content = mode
     ? `**Which pengu wears it better?** _(mode: ${traitType} → ${value})_`
     : '**Which pengu wears it better?**';
-  return { content, embeds, components: [row] };
+  return { content, embeds: [embed], files: [attachment], components: [row] };
 }
 
 client.on('interactionCreate', async (interaction) => {
@@ -169,7 +177,9 @@ client.on('interactionCreate', async (interaction) => {
         if (!pair) {
           return interaction.reply({ content: `Not enough pengus tagged **${traitType} → ${value}** for a matchup.`, flags: MessageFlags.Ephemeral });
         }
-        return interaction.reply(faceoffMessage(...pair, traitType, value));
+        await interaction.deferReply(); // image fetch + render can exceed the 3s ack window
+        const msg = await faceoffMessage(...pair, traitType, value);
+        return interaction.editReply(msg);
       }
       if (interaction.commandName === 'leaderboard') {
         const traitType = interaction.options.getString('trait');
@@ -184,16 +194,19 @@ client.on('interactionCreate', async (interaction) => {
         if (!rows.length) {
           return interaction.reply({ content: 'No qualified pengus yet — run /faceoff and get voting.', flags: MessageFlags.Ephemeral });
         }
+        await interaction.deferReply();
         const medals = ['🥇', '🥈', '🥉'];
         const lines = rows.map((p, i) =>
           `${medals[i] ?? `**${i + 1}.**`} Pengu #${p.token_id} — ${Math.round(p.elo)} Elo (${p.wins}W/${p.losses}L)`);
         const embed = new EmbedBuilder()
           .setTitle(traitType ? `🏆 Leaderboard — ${traitType}: ${value}` : '🏆 Huddle Hot-or-Not Leaderboard')
           .setDescription(lines.join('\n'))
-          .setThumbnail(IMAGE_URL(rows[0].token_id))
           .setColor(0xFFD700)
           .setFooter({ text: 'Elo rating · min 3 matchups to qualify' });
-        return interaction.reply({ embeds: [embed] });
+        try {
+          embed.setThumbnail(await imageCache.getImageUrl(rows[0].token_id));
+        } catch { /* thumbnail is a nice-to-have; skip silently if resolution fails */ }
+        return interaction.editReply({ embeds: [embed] });
       }
       if (interaction.commandName === 'mystats') {
         const { total } = userStats.get(interaction.user.id);
@@ -212,7 +225,10 @@ client.on('interactionCreate', async (interaction) => {
         if (!pair) {
           return interaction.reply({ content: `Not enough pengus tagged **${traitType} → ${value}** for a matchup.`, flags: MessageFlags.Ephemeral });
         }
-        return interaction.reply(faceoffMessage(...pair, traitType, value));
+        // Ephemeral: only the clicker sees their new matchup, so the channel doesn't fill up
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+        const msg = await faceoffMessage(...pair, traitType, value);
+        return interaction.editReply(msg);
       }
       if (interaction.customId.startsWith('vote:')) {
         const [, matchupId, winner, loser] = interaction.customId.split(':');
@@ -221,21 +237,27 @@ client.on('interactionCreate', async (interaction) => {
         }
         recordVote(matchupId, interaction.user.id, Number(winner), Number(loser));
 
-        // Update live tally on the message
+        // Update the combined vote tally in the single embed's footer
         const tally = matchupTally.all(matchupId);
         const counts = Object.fromEntries(tally.map(t => [t.winner, t.n]));
-        const embeds = interaction.message.embeds.map(e => {
-          const id = Number(e.title.replace('Pengu #', ''));
-          return EmbedBuilder.from(e).setFooter({ text: `${counts[id] ?? 0} vote${(counts[id] ?? 0) === 1 ? '' : 's'}` });
-        });
+        const [origEmbed] = interaction.message.embeds;
+        const match = origEmbed?.title?.match(/Pengu #(\d+)\s+vs\s+Pengu #(\d+)/);
+        let embeds = interaction.message.embeds;
+        if (match) {
+          const [, idA, idB] = match;
+          const footerText = `#${idA}: ${counts[idA] ?? 0} · #${idB}: ${counts[idB] ?? 0}`;
+          embeds = [EmbedBuilder.from(origEmbed).setFooter({ text: footerText })];
+        }
         await interaction.update({ embeds });
         return;
       }
     }
   } catch (err) {
     console.error(err);
-    if (interaction.isRepliable() && !interaction.replied) {
+    if (interaction.isRepliable() && !interaction.replied && !interaction.deferred) {
       interaction.reply({ content: 'Something slipped on the ice. Try again.', flags: MessageFlags.Ephemeral }).catch(() => {});
+    } else if (interaction.isRepliable() && interaction.deferred) {
+      interaction.editReply({ content: 'Something slipped on the ice. Try again.' }).catch(() => {});
     }
   }
 });
