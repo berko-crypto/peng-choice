@@ -14,6 +14,11 @@ const TOKEN = process.env.DISCORD_TOKEN;
 const CLIENT_ID = process.env.DISCORD_CLIENT_ID;
 const COLLECTION_SIZE = 8888; // token IDs 0–8887
 
+// First trait "mode" button. Overridable via env in case your loaded metadata
+// uses different exact trait naming (matching is case-insensitive either way).
+const BOWLCUT_TRAIT = process.env.BOWLCUT_TRAIT_TYPE || 'Head';
+const BOWLCUT_VALUE = process.env.BOWLCUT_TRAIT_VALUE || 'Bowlcut';
+
 // ---------- DB ----------
 const db = new Database(process.env.DB_PATH || 'faceoff.db');
 db.pragma('journal_mode = WAL');
@@ -34,8 +39,8 @@ db.exec(`
   );
   CREATE TABLE IF NOT EXISTS traits (
     token_id INTEGER NOT NULL,
-    trait_type TEXT NOT NULL,
-    value TEXT NOT NULL,
+    trait_type TEXT NOT NULL COLLATE NOCASE,
+    value TEXT NOT NULL COLLATE NOCASE,
     PRIMARY KEY (token_id, trait_type)
   );
   CREATE INDEX IF NOT EXISTS idx_traits_lookup ON traits (trait_type, value);
@@ -160,6 +165,11 @@ async function faceoffMessage(a, b, traitType, value) {
     .setColor(0x00A9E0)
     .setFooter({ text: '0 votes' });
 
+  const isBowlcutMode = mode.toLowerCase() === `${BOWLCUT_TRAIT}=${BOWLCUT_VALUE}`.toLowerCase();
+  const modeButton = isBowlcutMode
+    ? new ButtonBuilder().setCustomId('switchmode:').setLabel('All Pengus').setStyle(ButtonStyle.Secondary).setEmoji('🎲')
+    : new ButtonBuilder().setCustomId(`switchmode:${BOWLCUT_TRAIT}=${BOWLCUT_VALUE}`).setLabel('Bowlcuts Mode').setStyle(ButtonStyle.Secondary).setEmoji('🎩');
+
   const row = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId(`vote:${matchupId}:${a}:${b}`)
       .setLabel(`#${a}`).setStyle(ButtonStyle.Primary),
@@ -167,6 +177,7 @@ async function faceoffMessage(a, b, traitType, value) {
       .setLabel(`#${b}`).setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId(`newfaceoff:${mode}`)
       .setLabel('New matchup').setStyle(ButtonStyle.Success).setEmoji('🐧'),
+    modeButton,
   );
   const content = mode
     ? `**Which pengu wears it better?** _(mode: ${traitType} → ${value})_`
@@ -250,6 +261,20 @@ client.on('interactionCreate', async (interaction) => {
     }
 
     if (interaction.isButton()) {
+      if (interaction.customId.startsWith('switchmode:')) {
+        const mode = interaction.customId.slice('switchmode:'.length);
+        const [traitType, value] = mode ? mode.split('=') : [undefined, undefined];
+        if (traitType && !traitCount.get().n) {
+          return interaction.reply({ content: 'No trait data loaded yet — ask an admin to run the trait loader.', flags: MessageFlags.Ephemeral });
+        }
+        const pair = randomPair(traitType, value);
+        if (!pair) {
+          return interaction.reply({ content: `Not enough pengus tagged **${traitType} → ${value}** for a matchup.`, flags: MessageFlags.Ephemeral });
+        }
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+        const msg = await faceoffMessage(...pair, traitType, value);
+        return interaction.editReply(msg);
+      }
       if (interaction.customId.startsWith('newfaceoff')) {
         const [, mode] = interaction.customId.split(':');
         const [traitType, value] = mode ? mode.split('=') : [undefined, undefined];
