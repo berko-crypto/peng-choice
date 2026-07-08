@@ -66,6 +66,9 @@ const traitValues = db.prepare(
 const tokensForTrait = db.prepare(
   `SELECT token_id FROM traits WHERE trait_type = ? AND value = ?`);
 const traitCount = db.prepare(`SELECT COUNT(*) AS n FROM traits`);
+const insertTrait = db.prepare(`
+  INSERT INTO traits (token_id, trait_type, value) VALUES (?, ?, ?)
+  ON CONFLICT(token_id, trait_type) DO UPDATE SET value = excluded.value`);
 
 const getPenguin = db.prepare('SELECT * FROM penguins WHERE token_id = ?');
 const upsertPenguin = db.prepare(`
@@ -101,6 +104,41 @@ function recordVote(matchupId, userId, winnerId, loserId) {
   tx();
 }
 
+// ---------- Trait metadata parsing (shared with loadTraits.js's logic) ----------
+function parseTraitsFile(text, ext) {
+  const rows = [];
+  if (ext === '.json') {
+    const data = JSON.parse(text);
+    for (const entry of data) {
+      const tokenId = entry.token_id ?? entry.tokenId ?? entry.id ?? entry.edition;
+      if (tokenId === undefined) continue;
+      const attrs = entry.attributes ?? entry.traits ?? [];
+      for (const a of attrs) {
+        const traitType = a.trait_type ?? a.traitType ?? a.type;
+        const value = a.value;
+        if (traitType == null || value == null) continue;
+        rows.push({ token_id: Number(tokenId), trait_type: String(traitType), value: String(value) });
+      }
+    }
+  } else if (ext === '.csv') {
+    const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
+    const header = lines[0].split(',').map(h => h.trim().toLowerCase());
+    const idIdx = header.indexOf('token_id');
+    const typeIdx = header.indexOf('trait_type');
+    const valIdx = header.indexOf('value');
+    if (idIdx === -1 || typeIdx === -1 || valIdx === -1) {
+      throw new Error('CSV must have header: token_id,trait_type,value');
+    }
+    for (const line of lines.slice(1)) {
+      const cols = line.split(',');
+      rows.push({ token_id: Number(cols[idIdx]), trait_type: cols[typeIdx].trim(), value: cols[valIdx].trim() });
+    }
+  } else {
+    throw new Error('Unsupported file type — attach a .json or .csv file');
+  }
+  return rows;
+}
+
 // ---------- Bot ----------
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
@@ -120,6 +158,10 @@ const commands = [
   new SlashCommandBuilder().setName('setfeatured')
     .setDescription('Admin: set the channel for the auto-refreshing Featured Matchup')
     .addChannelOption(o => o.setName('channel').setDescription('Channel to post/refresh the featured matchup in').setRequired(true))
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
+  new SlashCommandBuilder().setName('loadtraits')
+    .setDescription('Admin: load/update trait metadata from an attached .json or .csv file')
+    .addAttachmentOption(o => o.setName('file').setDescription('metadata.json (attributes array) or .csv (token_id,trait_type,value)').setRequired(true))
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
 ].map(c => c.toJSON());
 
@@ -257,6 +299,25 @@ client.on('interactionCreate', async (interaction) => {
         setFeaturedConfig.run(interaction.guildId, channel.id);
         await interaction.reply({ content: `Featured Matchup will now post/refresh in <#${channel.id}>.`, flags: MessageFlags.Ephemeral });
         return refreshFeatured(interaction.guildId); // post the first one immediately
+      }
+      if (interaction.commandName === 'loadtraits') {
+        const file = interaction.options.getAttachment('file');
+        const ext = '.' + file.name.split('.').pop().toLowerCase();
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+        try {
+          const res = await fetch(file.url);
+          if (!res.ok) throw new Error(`Failed to download attachment: HTTP ${res.status}`);
+          const text = await res.text();
+          const rows = parseTraitsFile(text, ext);
+          const tx = db.transaction((rs) => { for (const r of rs) insertTrait.run(r.token_id, r.trait_type, r.value); });
+          tx(rows);
+          const { n: total } = traitCount.get();
+          const { n: types } = db.prepare('SELECT COUNT(DISTINCT trait_type) AS n FROM traits').get();
+          return interaction.editReply(`Loaded **${rows.length}** trait rows from \`${file.name}\`. DB now has **${total}** total rows across **${types}** trait types.`);
+        } catch (err) {
+          console.error('[loadtraits] failed:', err);
+          return interaction.editReply(`Failed to load traits: ${err.message}`);
+        }
       }
     }
 
