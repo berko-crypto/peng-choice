@@ -7,7 +7,7 @@ const {
   AttachmentBuilder,
 } = require('discord.js');
 const Database = require('better-sqlite3');
-const { createImageCache } = require('./lib/pudgyImages');
+const { getImageUrl } = require('./lib/pudgyImages');
 const { buildMatchupImage } = require('./lib/composite');
 
 const TOKEN = process.env.DISCORD_TOKEN;
@@ -48,7 +48,6 @@ const traitValues = db.prepare(
 const tokensForTrait = db.prepare(
   `SELECT token_id FROM traits WHERE trait_type = ? AND value = ?`);
 const traitCount = db.prepare(`SELECT COUNT(*) AS n FROM traits`);
-const imageCache = createImageCache(db);
 
 const getPenguin = db.prepare('SELECT * FROM penguins WHERE token_id = ?');
 const upsertPenguin = db.prepare(`
@@ -121,8 +120,7 @@ async function faceoffMessage(a, b, traitType, value) {
   const mode = traitType && value ? `${traitType}=${value}` : '';
   const matchupId = `${a}v${b}-${Date.now().toString(36)}`;
 
-  const [urlA, urlB] = await Promise.all([imageCache.getImageUrl(a), imageCache.getImageUrl(b)]);
-  const imageBuffer = await buildMatchupImage(urlA, urlB);
+  const imageBuffer = await buildMatchupImage(a, b);
   const filename = `matchup-${matchupId}.png`;
   const attachment = new AttachmentBuilder(imageBuffer, { name: filename });
 
@@ -203,9 +201,7 @@ client.on('interactionCreate', async (interaction) => {
           .setDescription(lines.join('\n'))
           .setColor(0xFFD700)
           .setFooter({ text: 'Elo rating · min 3 matchups to qualify' });
-        try {
-          embed.setThumbnail(await imageCache.getImageUrl(rows[0].token_id));
-        } catch { /* thumbnail is a nice-to-have; skip silently if resolution fails */ }
+        embed.setThumbnail(getImageUrl(rows[0].token_id));
         return interaction.editReply({ embeds: [embed] });
       }
       if (interaction.commandName === 'mystats') {
@@ -245,8 +241,19 @@ client.on('interactionCreate', async (interaction) => {
         let embeds = interaction.message.embeds;
         if (match) {
           const [, idA, idB] = match;
+          const filename = `matchup-${matchupId}.png`;
           const footerText = `#${idA}: ${counts[idA] ?? 0} · #${idB}: ${counts[idB] ?? 0}`;
-          embeds = [EmbedBuilder.from(origEmbed).setFooter({ text: footerText })];
+          // Rebuilt fresh (not EmbedBuilder.from(origEmbed)) — Discord resolves
+          // attachment:// references into a CDN URL in cached message data, and
+          // copying that resolved URL back causes the image to render twice
+          // (once as the raw attachment, once as the "external" embed image).
+          embeds = [
+            new EmbedBuilder()
+              .setTitle(origEmbed.title)
+              .setColor(origEmbed.color ?? 0x00A9E0)
+              .setImage(`attachment://${filename}`)
+              .setFooter({ text: footerText }),
+          ];
         }
         await interaction.update({ embeds });
         return;
