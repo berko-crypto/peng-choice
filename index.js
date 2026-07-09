@@ -30,6 +30,9 @@ const fromInternalId = (id) =>
 const BOWLCUT_TRAIT = process.env.BOWLCUT_TRAIT_TYPE || 'Head';
 const BOWLCUT_VALUE = process.env.BOWLCUT_TRAIT_VALUE || 'Bowl Cut';
 
+// Chance that a matchup becomes a 3-way "triple threat" (when the pool allows).
+const TRIPLE_CHANCE = Number(process.env.TRIPLE_CHANCE ?? 0.2);
+
 // ---------- DB ----------
 const db = new Database(process.env.DB_PATH || 'faceoff.db');
 db.pragma('journal_mode = WAL');
@@ -117,16 +120,20 @@ const matchupTally = db.prepare(`
 
 // ---------- Elo ----------
 const K = 32;
-function recordVote(matchupId, userId, winnerId, loserId) {
+// loserIds is an array (1 loser for classic 1v1, 2 for a triple threat).
+// Elo updates pairwise: the winner "beats" each loser independently.
+function recordVote(matchupId, userId, winnerId, loserIds) {
   const tx = db.transaction(() => {
-    insertVote.run(matchupId, userId, winnerId, loserId, Date.now());
+    insertVote.run(matchupId, userId, winnerId, loserIds[0], Date.now());
     upsertPenguin.run(winnerId);
-    upsertPenguin.run(loserId);
-    const w = getPenguin.get(winnerId);
-    const l = getPenguin.get(loserId);
-    const expectedW = 1 / (1 + 10 ** ((l.elo - w.elo) / 400));
-    updatePenguin.run(w.wins + 1, w.losses, w.elo + K * (1 - expectedW), winnerId);
-    updatePenguin.run(l.wins, l.losses + 1, l.elo - K * (1 - expectedW), loserId);
+    for (const loserId of loserIds) upsertPenguin.run(loserId);
+    for (const loserId of loserIds) {
+      const w = getPenguin.get(winnerId);
+      const l = getPenguin.get(loserId);
+      const expectedW = 1 / (1 + 10 ** ((l.elo - w.elo) / 400));
+      updatePenguin.run(w.wins + 1, w.losses, w.elo + K * (1 - expectedW), winnerId);
+      updatePenguin.run(l.wins, l.losses + 1, l.elo - K * (1 - expectedW), loserId);
+    }
   });
   tx();
 }
@@ -302,24 +309,30 @@ const commands = [
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
 ].map(c => c.toJSON());
 
-function randomPair(traitType, value) {
-  if (traitType && value) {
-    const pool = tokensForTrait.all(traitType, value).map(r => r.token_id);
-    if (pool.length < 2) return null; // not enough pengus in this mode
-    const a = pool[Math.floor(Math.random() * pool.length)];
-    let b = pool[Math.floor(Math.random() * pool.length)];
-    while (b === a) b = pool[Math.floor(Math.random() * pool.length)];
-    return [a, b];
+// Picks `count` distinct random items from a pool (returns null if pool too small).
+function pickN(pool, count) {
+  if (pool.length < count) return null;
+  const copy = [...pool];
+  const out = [];
+  for (let i = 0; i < count; i++) {
+    const idx = Math.floor(Math.random() * copy.length);
+    out.push(copy.splice(idx, 1)[0]);
   }
-  const a = Math.floor(Math.random() * COLLECTION_SIZE);
-  let b = Math.floor(Math.random() * COLLECTION_SIZE);
-  while (b === a) b = Math.floor(Math.random() * COLLECTION_SIZE);
-  return [a, b];
+  return out;
 }
 
-// Picks a same-type pair (BIG-vs-BIG or LIL-vs-LIL, never mixed) from the
+function randomPair(traitType, value, count = 2) {
+  if (traitType && value) {
+    const pool = tokensForTrait.all(traitType, value).map(r => r.token_id);
+    return pickN(pool, count) ?? pickN(pool, 2); // fall back to 2 if pool too small for 3
+  }
+  const pool = Array.from({ length: COLLECTION_SIZE }, (_, i) => i);
+  return pickN(pool, count);
+}
+
+// Picks a same-type group (BIG-vs-BIG or LIL-vs-LIL, never mixed) from the
 // curated PFPenguins roster. Returns internal ids (offset-applied for LIL).
-function randomPfpPair() {
+function randomPfpPair(count = 2) {
   const bigPool = pfpTokensByType.all('BIG').map(r => r.token_id);
   const lilPool = pfpTokensByType.all('LIL').map(r => r.token_id);
   const eligibleTypes = [];
@@ -329,20 +342,20 @@ function randomPfpPair() {
 
   const type = eligibleTypes[Math.floor(Math.random() * eligibleTypes.length)];
   const pool = type === 'BIG' ? bigPool : lilPool;
-  const a = pool[Math.floor(Math.random() * pool.length)];
-  let b = pool[Math.floor(Math.random() * pool.length)];
-  while (b === a) b = pool[Math.floor(Math.random() * pool.length)];
-  return [toInternalId(a, type), toInternalId(b, type)];
+  const picked = pickN(pool, count) ?? pickN(pool, 2);
+  return picked ? picked.map(id => toInternalId(id, type)) : null;
 }
 
 // mode is one of: '' (full random), 'PFP' (curated roster), or 'TraitType=Value'
+// Returns an array of 2 or 3 internal ids (occasionally 3-way, when pool allows).
 function pairForMode(mode) {
-  if (mode === 'PFP') return randomPfpPair();
+  const count = Math.random() < TRIPLE_CHANCE ? 3 : 2;
+  if (mode === 'PFP') return randomPfpPair(count);
   if (mode) {
     const [traitType, value] = mode.split('=');
-    return randomPair(traitType, value);
+    return randomPair(traitType, value, count);
   }
-  return randomPair();
+  return randomPair(undefined, undefined, count);
 }
 
 function modeGuardError(mode) {
@@ -380,30 +393,29 @@ function topPair() {
   return [a, b];
 }
 
-async function faceoffMessage(a, b, mode = '') {
+async function faceoffMessage(ids, mode = '') {
   const isPfp = mode === 'PFP';
-  const matchupId = `${a}v${b}-${Date.now().toString(36)}`;
+  const matchupId = `${ids.join('v')}-${Date.now().toString(36)}`;
 
   // Always decode — Featured Matchup's top-N pool and PFPenguins mode can both
   // hand back offset LIL ids even when mode itself doesn't say 'PFP'.
-  const { rawId: rawA, type: typeA } = fromInternalId(a);
-  const { rawId: rawB, type: typeB } = fromInternalId(b);
+  const contestants = ids.map(id => {
+    const { rawId, type } = fromInternalId(id);
+    const handle = isPfp ? getPfpHandle.get(rawId, type)?.twitter_handle : null;
+    const name = type === 'LIL' ? 'Lil Pudgy' : 'Pengu';
+    return {
+      id, rawId, type,
+      label: handle ? `@${handle}` : `#${rawId}`,
+      title: handle ? `${name} #${rawId} (@${handle})` : `${name} #${rawId}`,
+    };
+  });
 
-  const imageBuffer = await buildMatchupImage({ id: rawA, type: typeA }, { id: rawB, type: typeB });
+  const imageBuffer = await buildMatchupImage(...contestants.map(c => ({ id: c.rawId, type: c.type })));
   const filename = `matchup-${matchupId}.png`;
   const attachment = new AttachmentBuilder(imageBuffer, { name: filename });
 
-  const handleA = isPfp ? getPfpHandle.get(rawA, typeA)?.twitter_handle : null;
-  const handleB = isPfp ? getPfpHandle.get(rawB, typeB)?.twitter_handle : null;
-  const nameA = typeA === 'LIL' ? 'Lil Pudgy' : 'Pengu';
-  const nameB = typeB === 'LIL' ? 'Lil Pudgy' : 'Pengu';
-  const labelA = handleA ? `@${handleA}` : `#${rawA}`;
-  const labelB = handleB ? `@${handleB}` : `#${rawB}`;
-  const titleA = handleA ? `${nameA} #${rawA} (@${handleA})` : `${nameA} #${rawA}`;
-  const titleB = handleB ? `${nameB} #${rawB} (@${handleB})` : `${nameB} #${rawB}`;
-
   const embed = new EmbedBuilder()
-    .setTitle(`${titleA}  vs  ${titleB}`)
+    .setTitle(contestants.map(c => c.title).join('  vs  '))
     .setImage(`attachment://${filename}`)
     .setColor(0x00A9E0)
     .setFooter({ text: '0 votes' });
@@ -416,19 +428,29 @@ async function faceoffMessage(a, b, mode = '') {
     ? new ButtonBuilder().setCustomId('switchmode:').setLabel('All Pengus').setStyle(ButtonStyle.Secondary).setEmoji('🎲')
     : new ButtonBuilder().setCustomId('switchmode:PFP').setLabel('PFPenguins Mode').setStyle(ButtonStyle.Secondary).setEmoji('🐦');
 
-  const row = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(`vote:${matchupId}:${a}:${b}`)
-      .setLabel(labelA).setStyle(ButtonStyle.Primary),
-    new ButtonBuilder().setCustomId(`vote:${matchupId}:${b}:${a}`)
-      .setLabel(labelB).setStyle(ButtonStyle.Secondary),
+  // Row 1: one vote button per contestant. Each customId carries the chosen
+  // winner then all other contestants (comma-separated losers) so pairwise
+  // Elo works for both 1v1 and triple threats.
+  const voteStyles = [ButtonStyle.Primary, ButtonStyle.Secondary, ButtonStyle.Secondary];
+  const voteRow = new ActionRowBuilder().addComponents(
+    contestants.map((c, i) => {
+      const losers = contestants.filter(o => o.id !== c.id).map(o => o.id).join(',');
+      return new ButtonBuilder().setCustomId(`vote:${matchupId}:${c.id}:${losers}`)
+        .setLabel(c.label).setStyle(voteStyles[i]);
+    })
+  );
+  // Row 2: utility buttons (kept separate so triple threats never overflow Discord's 5-per-row limit).
+  const utilityRow = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId(`newfaceoff:${mode}`)
       .setLabel('New matchup').setStyle(ButtonStyle.Success).setEmoji('🐧'),
     bowlcutButton,
     pfpButton,
   );
+
+  const tripleNote = contestants.length === 3 ? ' ⚡ **TRIPLE THREAT!**' : '';
   const modeNote = isPfp ? ' _(mode: PFPenguins)_' : (mode ? ` _(mode: ${mode.replace('=', ' → ')})_` : '');
-  const content = `**Which pengu wears it better?**${modeNote}`;
-  return { content, embeds: [embed], files: [attachment], components: [row] };
+  const content = `**Which pengu wears it better?**${tripleNote}${modeNote}`;
+  return { content, embeds: [embed], files: [attachment], components: [voteRow, utilityRow] };
 }
 
 client.on('interactionCreate', async (interaction) => {
@@ -466,7 +488,7 @@ client.on('interactionCreate', async (interaction) => {
           return interaction.reply({ content: `Not enough pengus for that mode yet.`, flags: MessageFlags.Ephemeral });
         }
         await interaction.deferReply(); // image fetch + render can exceed the 3s ack window
-        const msg = await faceoffMessage(...pair, mode);
+        const msg = await faceoffMessage(pair, mode);
         return interaction.editReply(msg);
       }
       if (interaction.commandName === 'leaderboard') {
@@ -578,7 +600,7 @@ client.on('interactionCreate', async (interaction) => {
           return interaction.reply({ content: 'Not enough pengus for that mode yet.', flags: MessageFlags.Ephemeral });
         }
         await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-        const msg = await faceoffMessage(...pair, mode);
+        const msg = await faceoffMessage(pair, mode);
         return interaction.editReply(msg);
       }
       if (interaction.customId.startsWith('newfaceoff')) {
@@ -589,26 +611,28 @@ client.on('interactionCreate', async (interaction) => {
         }
         // Ephemeral: only the clicker sees their new matchup, so the channel doesn't fill up
         await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-        const msg = await faceoffMessage(...pair, mode);
+        const msg = await faceoffMessage(pair, mode);
         return interaction.editReply(msg);
       }
       if (interaction.customId.startsWith('vote:')) {
-        const [, matchupId, winner, loser] = interaction.customId.split(':');
+        const [, matchupId, winner, losersStr] = interaction.customId.split(':');
         if (hasVoted.get(matchupId, interaction.user.id)) {
           return interaction.reply({ content: 'One vote per matchup, penguin. 🐧', flags: MessageFlags.Ephemeral });
         }
-        recordVote(matchupId, interaction.user.id, Number(winner), Number(loser));
+        const loserIds = losersStr.split(',').map(Number);
+        recordVote(matchupId, interaction.user.id, Number(winner), loserIds);
 
-        // Update the combined vote tally in the single embed's footer. Both ids
-        // come straight from this click's own customId (matchupId only ever
-        // has these two candidates), not from parsing the title — avoids
-        // fragile regex and raw-vs-internal id mixups for LIL matchups.
+        // Update the combined vote tally in the single embed's footer. All
+        // contestant ids come from this click's own customId (winner + losers),
+        // not from parsing the title — avoids fragile regex and raw-vs-internal
+        // id mixups for LIL matchups.
         const tally = matchupTally.all(matchupId);
         const counts = Object.fromEntries(tally.map(t => [t.winner, t.n]));
-        const { rawId: rawWinner } = fromInternalId(Number(winner));
-        const { rawId: rawLoser } = fromInternalId(Number(loser));
+        const allIds = [Number(winner), ...loserIds].sort((x, y) => x - y);
         const filename = `matchup-${matchupId}.png`;
-        const footerText = `#${rawWinner}: ${counts[winner] ?? 0} · #${rawLoser}: ${counts[loser] ?? 0}`;
+        const footerText = allIds
+          .map(id => `#${fromInternalId(id).rawId}: ${counts[id] ?? 0}`)
+          .join(' · ');
         const [origEmbed] = interaction.message.embeds;
         // Rebuilt fresh (not EmbedBuilder.from(origEmbed)) — Discord resolves
         // attachment:// references into a CDN URL in cached message data, and
@@ -622,6 +646,22 @@ client.on('interactionCreate', async (interaction) => {
             .setFooter({ text: footerText }),
         ];
         await interaction.update({ embeds });
+
+        // Auto-advance: immediately hand the voter a fresh matchup in the same
+        // mode, ephemeral so it doesn't touch the shared public message/tally.
+        try {
+          const newFaceoffButton = interaction.message.components
+            .flatMap(row => row.components)
+            .find(c => c.customId?.startsWith('newfaceoff:'));
+          const mode = newFaceoffButton ? newFaceoffButton.customId.slice('newfaceoff:'.length) : '';
+          const nextPair = pairForMode(mode);
+          if (nextPair) {
+            const nextMsg = await faceoffMessage(nextPair, mode);
+            await interaction.followUp({ ...nextMsg, flags: MessageFlags.Ephemeral });
+          }
+        } catch (err) {
+          console.error('[vote] auto-advance failed:', err); // vote itself already succeeded, so just log and move on
+        }
         return;
       }
     }
@@ -646,7 +686,7 @@ async function refreshFeatured(guildId) {
   }
   try {
     const channel = await client.channels.fetch(config.channel_id);
-    const msg = await faceoffMessage(...pair);
+    const msg = await faceoffMessage(pair);
     msg.content = `🌟 **Featured Matchup — Top Contenders!** ${msg.content}`;
 
     if (config.message_id) {
