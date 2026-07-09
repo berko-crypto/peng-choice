@@ -14,6 +14,17 @@ const TOKEN = process.env.DISCORD_TOKEN;
 const CLIENT_ID = process.env.DISCORD_CLIENT_ID;
 const COLLECTION_SIZE = 8888; // token IDs 0–8887
 
+// BIG (main Pudgy Penguins, 0-8887) and LIL (Lil Pudgys, 0-22221) share the
+// same votes/Elo tables, keyed by a single "internal id" integer. LIL ids are
+// offset well above both ranges so a BIG #123 and a LIL #123 never collide.
+// Anywhere outside this offset/decode pair, code should only ever see the
+// internal id (for votes/Elo/customIds) or the decoded {rawId, type} (for
+// display and image lookups) — never mix the two.
+const LIL_ID_OFFSET = 100000;
+const toInternalId = (rawId, type) => (type === 'LIL' ? LIL_ID_OFFSET + rawId : rawId);
+const fromInternalId = (id) =>
+  id >= LIL_ID_OFFSET ? { rawId: id - LIL_ID_OFFSET, type: 'LIL' } : { rawId: id, type: 'BIG' };
+
 // First trait "mode" button. Overridable via env in case your loaded metadata
 // uses different exact trait naming (matching is case-insensitive either way).
 const BOWLCUT_TRAIT = process.env.BOWLCUT_TRAIT_TYPE || 'Head';
@@ -49,6 +60,13 @@ db.exec(`
     channel_id TEXT NOT NULL,
     message_id TEXT
   );
+  CREATE TABLE IF NOT EXISTS pfp_penguins (
+    token_id INTEGER NOT NULL,
+    penguin_type TEXT NOT NULL DEFAULT 'BIG',
+    twitter_handle TEXT,
+    discord_username TEXT,
+    PRIMARY KEY (token_id, penguin_type)
+  );
 `);
 
 const getFeaturedConfig = db.prepare('SELECT * FROM featured_config WHERE guild_id = ?');
@@ -69,6 +87,15 @@ const traitCount = db.prepare(`SELECT COUNT(*) AS n FROM traits`);
 const insertTrait = db.prepare(`
   INSERT INTO traits (token_id, trait_type, value) VALUES (?, ?, ?)
   ON CONFLICT(token_id, trait_type) DO UPDATE SET value = excluded.value`);
+
+const pfpCount = db.prepare(`SELECT COUNT(*) AS n FROM pfp_penguins`);
+const pfpTokensByType = db.prepare(`SELECT token_id FROM pfp_penguins WHERE penguin_type = ?`);
+const getPfpHandle = db.prepare(`SELECT twitter_handle FROM pfp_penguins WHERE token_id = ? AND penguin_type = ?`);
+const upsertPfp = db.prepare(`
+  INSERT INTO pfp_penguins (token_id, penguin_type, twitter_handle, discord_username) VALUES (?, ?, ?, ?)
+  ON CONFLICT(token_id, penguin_type) DO UPDATE SET
+    twitter_handle = COALESCE(excluded.twitter_handle, pfp_penguins.twitter_handle),
+    discord_username = COALESCE(excluded.discord_username, pfp_penguins.discord_username)`);
 
 const getPenguin = db.prepare('SELECT * FROM penguins WHERE token_id = ?');
 const upsertPenguin = db.prepare(`
@@ -137,6 +164,62 @@ function parseTraitsFile(text, ext) {
     throw new Error('Unsupported file type — attach a .json or .csv file');
   }
   return rows;
+}
+
+// ---------- PFPenguins roster parsing ----------
+// Handles the export format with quoted, comma-separated fields (some values
+// can legitimately be "null" as literal text, not just empty).
+function parseCsvLine(line) {
+  const out = [];
+  let cur = '';
+  let inQuotes = false;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (inQuotes) {
+      if (c === '"') {
+        if (line[i + 1] === '"') { cur += '"'; i++; } else { inQuotes = false; }
+      } else cur += c;
+    } else {
+      if (c === '"') inQuotes = true;
+      else if (c === ',') { out.push(cur); cur = ''; }
+      else cur += c;
+    }
+  }
+  out.push(cur);
+  return out;
+}
+
+function parsePfpFile(text) {
+  const clean = text.replace(/^\uFEFF/, ''); // strip BOM if present
+  const lines = clean.split('\n').map(l => l.replace(/\r$/, '')).filter(l => l.trim().length);
+  const header = parseCsvLine(lines[0]).map(h => h.trim().toLowerCase());
+  const idIdx = header.indexOf('penguinid');
+  const typeIdx = header.indexOf('penguintype');
+  const twitterIdx = header.indexOf('twitterusername');
+  const discordIdx = header.indexOf('discordusername');
+  if (idIdx === -1 || typeIdx === -1) {
+    throw new Error('CSV must include penguinId and penguinType columns');
+  }
+
+  const map = new Map(); // "type:id" -> best row seen (prefers one with a real handle)
+  let skippedInvalid = 0;
+  for (const line of lines.slice(1)) {
+    const cols = parseCsvLine(line);
+    const type = (cols[typeIdx] || '').trim().toUpperCase() === 'LIL' ? 'LIL' : 'BIG';
+    const tokenId = Number((cols[idIdx] || '').trim());
+    if (!Number.isInteger(tokenId)) { skippedInvalid++; continue; }
+    const rawTwitter = twitterIdx !== -1 ? (cols[twitterIdx] || '').trim() : '';
+    const rawDiscord = discordIdx !== -1 ? (cols[discordIdx] || '').trim() : '';
+    const twitter = rawTwitter && rawTwitter.toLowerCase() !== 'null' ? rawTwitter : null;
+    const discordName = rawDiscord && rawDiscord.toLowerCase() !== 'null' ? rawDiscord : null;
+    const key = `${type}:${tokenId}`;
+    const existing = map.get(key);
+    if (!existing || (!existing.twitter_handle && twitter)) {
+      map.set(key, { token_id: tokenId, penguin_type: type, twitter_handle: twitter, discord_username: discordName });
+    }
+  }
+  const rows = [...map.values()];
+  return { rows, skippedInvalid, bigCount: rows.filter(r => r.penguin_type === 'BIG').length, lilCount: rows.filter(r => r.penguin_type === 'LIL').length };
 }
 
 // ---------- Bulk on-chain trait fetch (one-time, admin-triggered) ----------
@@ -213,6 +296,10 @@ const commands = [
   new SlashCommandBuilder().setName('fetchmetadata')
     .setDescription('Admin: pull trait data for all 8888 penguins on-chain (takes 10-20+ min, runs in background)')
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
+  new SlashCommandBuilder().setName('loadpfp')
+    .setDescription('Admin: load the PFPenguins roster from an attached CSV (penguinId, penguinType, twitterUsername columns)')
+    .addAttachmentOption(o => o.setName('file').setDescription('CSV export with penguinId/penguinType/twitterUsername/discordUsername columns').setRequired(true))
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
 ].map(c => c.toJSON());
 
 function randomPair(traitType, value) {
@@ -230,50 +317,117 @@ function randomPair(traitType, value) {
   return [a, b];
 }
 
+// Picks a same-type pair (BIG-vs-BIG or LIL-vs-LIL, never mixed) from the
+// curated PFPenguins roster. Returns internal ids (offset-applied for LIL).
+function randomPfpPair() {
+  const bigPool = pfpTokensByType.all('BIG').map(r => r.token_id);
+  const lilPool = pfpTokensByType.all('LIL').map(r => r.token_id);
+  const eligibleTypes = [];
+  if (bigPool.length >= 2) eligibleTypes.push('BIG');
+  if (lilPool.length >= 2) eligibleTypes.push('LIL');
+  if (!eligibleTypes.length) return null;
+
+  const type = eligibleTypes[Math.floor(Math.random() * eligibleTypes.length)];
+  const pool = type === 'BIG' ? bigPool : lilPool;
+  const a = pool[Math.floor(Math.random() * pool.length)];
+  let b = pool[Math.floor(Math.random() * pool.length)];
+  while (b === a) b = pool[Math.floor(Math.random() * pool.length)];
+  return [toInternalId(a, type), toInternalId(b, type)];
+}
+
+// mode is one of: '' (full random), 'PFP' (curated roster), or 'TraitType=Value'
+function pairForMode(mode) {
+  if (mode === 'PFP') return randomPfpPair();
+  if (mode) {
+    const [traitType, value] = mode.split('=');
+    return randomPair(traitType, value);
+  }
+  return randomPair();
+}
+
+function modeGuardError(mode) {
+  if (mode === 'PFP') {
+    return pfpCount.get().n ? null : 'No PFPenguins loaded yet — ask an admin to run /loadpfp.';
+  }
+  if (mode) {
+    return traitCount.get().n ? null : 'No trait data loaded yet — ask an admin to run the trait loader.';
+  }
+  return null;
+}
+
 // Random pair drawn from the current top-N leaderboard, for the featured matchup —
 // keeps it fresh (not always literally #1 vs #2) while still spotlighting favorites.
+// Type-aware: BIG and LIL entries share the same Elo table (via the id offset),
+// so this picks its top-N pool per type and only pairs within one type.
 const FEATURED_POOL_SIZE = 10;
 const FEATURED_MIN_MATCHUPS = 3;
+const topPenguinsInRange = db.prepare(`
+  SELECT token_id, wins, losses, elo FROM penguins
+  WHERE wins + losses >= ? AND token_id >= ? AND token_id < ?
+  ORDER BY elo DESC LIMIT ?`);
 function topPair() {
-  const pool = topPenguins.all(FEATURED_MIN_MATCHUPS, FEATURED_POOL_SIZE).map(p => p.token_id);
-  if (pool.length < 2) return null;
+  const bigPool = topPenguinsInRange.all(FEATURED_MIN_MATCHUPS, 0, LIL_ID_OFFSET, FEATURED_POOL_SIZE).map(p => p.token_id);
+  const lilPool = topPenguinsInRange.all(FEATURED_MIN_MATCHUPS, LIL_ID_OFFSET, Number.MAX_SAFE_INTEGER, FEATURED_POOL_SIZE).map(p => p.token_id);
+  const eligible = [];
+  if (bigPool.length >= 2) eligible.push(bigPool);
+  if (lilPool.length >= 2) eligible.push(lilPool);
+  if (!eligible.length) return null;
+
+  const pool = eligible[Math.floor(Math.random() * eligible.length)];
   const a = pool[Math.floor(Math.random() * pool.length)];
   let b = pool[Math.floor(Math.random() * pool.length)];
   while (b === a) b = pool[Math.floor(Math.random() * pool.length)];
   return [a, b];
 }
 
-async function faceoffMessage(a, b, traitType, value) {
-  const mode = traitType && value ? `${traitType}=${value}` : '';
+async function faceoffMessage(a, b, mode = '') {
+  const isPfp = mode === 'PFP';
   const matchupId = `${a}v${b}-${Date.now().toString(36)}`;
 
-  const imageBuffer = await buildMatchupImage(a, b);
+  // Always decode — Featured Matchup's top-N pool and PFPenguins mode can both
+  // hand back offset LIL ids even when mode itself doesn't say 'PFP'.
+  const { rawId: rawA, type: typeA } = fromInternalId(a);
+  const { rawId: rawB, type: typeB } = fromInternalId(b);
+
+  const imageBuffer = await buildMatchupImage({ id: rawA, type: typeA }, { id: rawB, type: typeB });
   const filename = `matchup-${matchupId}.png`;
   const attachment = new AttachmentBuilder(imageBuffer, { name: filename });
 
+  const handleA = isPfp ? getPfpHandle.get(rawA, typeA)?.twitter_handle : null;
+  const handleB = isPfp ? getPfpHandle.get(rawB, typeB)?.twitter_handle : null;
+  const nameA = typeA === 'LIL' ? 'Lil Pudgy' : 'Pengu';
+  const nameB = typeB === 'LIL' ? 'Lil Pudgy' : 'Pengu';
+  const labelA = handleA ? `@${handleA}` : `#${rawA}`;
+  const labelB = handleB ? `@${handleB}` : `#${rawB}`;
+  const titleA = handleA ? `${nameA} #${rawA} (@${handleA})` : `${nameA} #${rawA}`;
+  const titleB = handleB ? `${nameB} #${rawB} (@${handleB})` : `${nameB} #${rawB}`;
+
   const embed = new EmbedBuilder()
-    .setTitle(`Pengu #${a}  vs  Pengu #${b}`)
+    .setTitle(`${titleA}  vs  ${titleB}`)
     .setImage(`attachment://${filename}`)
     .setColor(0x00A9E0)
     .setFooter({ text: '0 votes' });
 
   const isBowlcutMode = mode.toLowerCase() === `${BOWLCUT_TRAIT}=${BOWLCUT_VALUE}`.toLowerCase();
-  const modeButton = isBowlcutMode
+  const bowlcutButton = isBowlcutMode
     ? new ButtonBuilder().setCustomId('switchmode:').setLabel('All Pengus').setStyle(ButtonStyle.Secondary).setEmoji('🎲')
     : new ButtonBuilder().setCustomId(`switchmode:${BOWLCUT_TRAIT}=${BOWLCUT_VALUE}`).setLabel('Bowlcuts Mode').setStyle(ButtonStyle.Secondary).setEmoji('🎩');
+  const pfpButton = isPfp
+    ? new ButtonBuilder().setCustomId('switchmode:').setLabel('All Pengus').setStyle(ButtonStyle.Secondary).setEmoji('🎲')
+    : new ButtonBuilder().setCustomId('switchmode:PFP').setLabel('PFPenguins Mode').setStyle(ButtonStyle.Secondary).setEmoji('🐦');
 
   const row = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId(`vote:${matchupId}:${a}:${b}`)
-      .setLabel(`#${a}`).setStyle(ButtonStyle.Primary),
+      .setLabel(labelA).setStyle(ButtonStyle.Primary),
     new ButtonBuilder().setCustomId(`vote:${matchupId}:${b}:${a}`)
-      .setLabel(`#${b}`).setStyle(ButtonStyle.Secondary),
+      .setLabel(labelB).setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId(`newfaceoff:${mode}`)
       .setLabel('New matchup').setStyle(ButtonStyle.Success).setEmoji('🐧'),
-    modeButton,
+    bowlcutButton,
+    pfpButton,
   );
-  const content = mode
-    ? `**Which pengu wears it better?** _(mode: ${traitType} → ${value})_`
-    : '**Which pengu wears it better?**';
+  const modeNote = isPfp ? ' _(mode: PFPenguins)_' : (mode ? ` _(mode: ${mode.replace('=', ' → ')})_` : '');
+  const content = `**Which pengu wears it better?**${modeNote}`;
   return { content, embeds: [embed], files: [attachment], components: [row] };
 }
 
@@ -301,15 +455,18 @@ client.on('interactionCreate', async (interaction) => {
         if ((traitType && !value) || (!traitType && value)) {
           return interaction.reply({ content: 'Pick both a trait and a value to filter, or leave both blank.', flags: MessageFlags.Ephemeral });
         }
-        if (traitType && !traitCount.get().n) {
-          return interaction.reply({ content: 'No trait data loaded yet — ask an admin to run the trait loader.', flags: MessageFlags.Ephemeral });
-        }
-        const pair = randomPair(traitType, value);
+        // Default to PFPenguins mode when there's roster data; fall back to
+        // full random automatically so a plain /faceoff never dead-ends before
+        // an admin has run /loadpfp.
+        const mode = traitType && value ? `${traitType}=${value}` : (pfpCount.get().n >= 2 ? 'PFP' : '');
+        const guardMsg = modeGuardError(mode);
+        if (guardMsg) return interaction.reply({ content: guardMsg, flags: MessageFlags.Ephemeral });
+        const pair = pairForMode(mode);
         if (!pair) {
-          return interaction.reply({ content: `Not enough pengus tagged **${traitType} → ${value}** for a matchup.`, flags: MessageFlags.Ephemeral });
+          return interaction.reply({ content: `Not enough pengus for that mode yet.`, flags: MessageFlags.Ephemeral });
         }
         await interaction.deferReply(); // image fetch + render can exceed the 3s ack window
-        const msg = await faceoffMessage(...pair, traitType, value);
+        const msg = await faceoffMessage(...pair, mode);
         return interaction.editReply(msg);
       }
       if (interaction.commandName === 'leaderboard') {
@@ -327,14 +484,17 @@ client.on('interactionCreate', async (interaction) => {
         }
         await interaction.deferReply();
         const medals = ['🥇', '🥈', '🥉'];
-        const lines = rows.map((p, i) =>
-          `${medals[i] ?? `**${i + 1}.**`} Pengu #${p.token_id} — ${Math.round(p.elo)} Elo (${p.wins}W/${p.losses}L)`);
+        const decoded = rows.map(p => ({ ...p, ...fromInternalId(p.token_id) }));
+        const lines = decoded.map((p, i) => {
+          const name = p.type === 'LIL' ? 'Lil Pudgy' : 'Pengu';
+          return `${medals[i] ?? `**${i + 1}.**`} ${name} #${p.rawId} — ${Math.round(p.elo)} Elo (${p.wins}W/${p.losses}L)`;
+        });
         const embed = new EmbedBuilder()
           .setTitle(traitType ? `🏆 Leaderboard — ${traitType}: ${value}` : '🏆 Huddle Hot-or-Not Leaderboard')
           .setDescription(lines.join('\n'))
           .setColor(0xFFD700)
           .setFooter({ text: 'Elo rating · min 3 matchups to qualify' });
-        embed.setThumbnail(getImageUrl(rows[0].token_id));
+        if (decoded[0].type === 'BIG') embed.setThumbnail(getImageUrl(decoded[0].rawId)); // LIL thumbnail needs an async resolve — skipped for now
         return interaction.editReply({ embeds: [embed] });
       }
       if (interaction.commandName === 'mystats') {
@@ -387,33 +547,49 @@ client.on('interactionCreate', async (interaction) => {
         });
         return;
       }
+      if (interaction.commandName === 'loadpfp') {
+        const file = interaction.options.getAttachment('file');
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+        try {
+          const res = await fetch(file.url);
+          if (!res.ok) throw new Error(`Failed to download attachment: HTTP ${res.status}`);
+          const text = await res.text();
+          const { rows, skippedInvalid, bigCount, lilCount } = parsePfpFile(text);
+          const tx = db.transaction((rs) => { for (const r of rs) upsertPfp.run(r.token_id, r.penguin_type, r.twitter_handle, r.discord_username); });
+          tx(rows);
+          const { n: total } = pfpCount.get();
+          return interaction.editReply(
+            `Loaded **${rows.length}** PFPenguins from \`${file.name}\` (**${bigCount}** Pudgy Penguins, **${lilCount}** Lil Pudgys, **${skippedInvalid}** invalid rows skipped). DB now has **${total}** total. Matchups always pair same-type (Pudgy-vs-Pudgy or Lil-vs-Lil).`
+          );
+        } catch (err) {
+          console.error('[loadpfp] failed:', err);
+          return interaction.editReply(`Failed to load PFPenguins: ${err.message}`);
+        }
+      }
     }
 
     if (interaction.isButton()) {
       if (interaction.customId.startsWith('switchmode:')) {
         const mode = interaction.customId.slice('switchmode:'.length);
-        const [traitType, value] = mode ? mode.split('=') : [undefined, undefined];
-        if (traitType && !traitCount.get().n) {
-          return interaction.reply({ content: 'No trait data loaded yet — ask an admin to run the trait loader.', flags: MessageFlags.Ephemeral });
-        }
-        const pair = randomPair(traitType, value);
+        const guardMsg = modeGuardError(mode);
+        if (guardMsg) return interaction.reply({ content: guardMsg, flags: MessageFlags.Ephemeral });
+        const pair = pairForMode(mode);
         if (!pair) {
-          return interaction.reply({ content: `Not enough pengus tagged **${traitType} → ${value}** for a matchup.`, flags: MessageFlags.Ephemeral });
+          return interaction.reply({ content: 'Not enough pengus for that mode yet.', flags: MessageFlags.Ephemeral });
         }
         await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-        const msg = await faceoffMessage(...pair, traitType, value);
+        const msg = await faceoffMessage(...pair, mode);
         return interaction.editReply(msg);
       }
       if (interaction.customId.startsWith('newfaceoff')) {
         const [, mode] = interaction.customId.split(':');
-        const [traitType, value] = mode ? mode.split('=') : [undefined, undefined];
-        const pair = randomPair(traitType, value);
+        const pair = pairForMode(mode);
         if (!pair) {
-          return interaction.reply({ content: `Not enough pengus tagged **${traitType} → ${value}** for a matchup.`, flags: MessageFlags.Ephemeral });
+          return interaction.reply({ content: 'Not enough pengus for that mode yet.', flags: MessageFlags.Ephemeral });
         }
         // Ephemeral: only the clicker sees their new matchup, so the channel doesn't fill up
         await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-        const msg = await faceoffMessage(...pair, traitType, value);
+        const msg = await faceoffMessage(...pair, mode);
         return interaction.editReply(msg);
       }
       if (interaction.customId.startsWith('vote:')) {
@@ -423,28 +599,28 @@ client.on('interactionCreate', async (interaction) => {
         }
         recordVote(matchupId, interaction.user.id, Number(winner), Number(loser));
 
-        // Update the combined vote tally in the single embed's footer
+        // Update the combined vote tally in the single embed's footer. Both ids
+        // come straight from this click's own customId (matchupId only ever
+        // has these two candidates), not from parsing the title — avoids
+        // fragile regex and raw-vs-internal id mixups for LIL matchups.
         const tally = matchupTally.all(matchupId);
         const counts = Object.fromEntries(tally.map(t => [t.winner, t.n]));
+        const { rawId: rawWinner } = fromInternalId(Number(winner));
+        const { rawId: rawLoser } = fromInternalId(Number(loser));
+        const filename = `matchup-${matchupId}.png`;
+        const footerText = `#${rawWinner}: ${counts[winner] ?? 0} · #${rawLoser}: ${counts[loser] ?? 0}`;
         const [origEmbed] = interaction.message.embeds;
-        const match = origEmbed?.title?.match(/Pengu #(\d+)\s+vs\s+Pengu #(\d+)/);
-        let embeds = interaction.message.embeds;
-        if (match) {
-          const [, idA, idB] = match;
-          const filename = `matchup-${matchupId}.png`;
-          const footerText = `#${idA}: ${counts[idA] ?? 0} · #${idB}: ${counts[idB] ?? 0}`;
-          // Rebuilt fresh (not EmbedBuilder.from(origEmbed)) — Discord resolves
-          // attachment:// references into a CDN URL in cached message data, and
-          // copying that resolved URL back causes the image to render twice
-          // (once as the raw attachment, once as the "external" embed image).
-          embeds = [
-            new EmbedBuilder()
-              .setTitle(origEmbed.title)
-              .setColor(origEmbed.color ?? 0x00A9E0)
-              .setImage(`attachment://${filename}`)
-              .setFooter({ text: footerText }),
-          ];
-        }
+        // Rebuilt fresh (not EmbedBuilder.from(origEmbed)) — Discord resolves
+        // attachment:// references into a CDN URL in cached message data, and
+        // copying that resolved URL back causes the image to render twice
+        // (once as the raw attachment, once as the "external" embed image).
+        const embeds = [
+          new EmbedBuilder()
+            .setTitle(origEmbed?.title ?? '')
+            .setColor(origEmbed?.color ?? 0x00A9E0)
+            .setImage(`attachment://${filename}`)
+            .setFooter({ text: footerText }),
+        ];
         await interaction.update({ embeds });
         return;
       }
