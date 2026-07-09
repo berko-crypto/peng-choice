@@ -297,7 +297,7 @@ const commands = [
     .setDescription('Admin: pull trait data for all 8888 penguins on-chain (takes 10-20+ min, runs in background)')
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
   new SlashCommandBuilder().setName('loadpfp')
-    .setDescription('Admin: load the PFPenguins roster from an attached CSV (penguinId, penguinType, twitterUsername columns)')
+    .setDescription('Admin: load the PFPenguins roster from an attached CSV')
     .addAttachmentOption(o => o.setName('file').setDescription('CSV export with penguinId/penguinType/twitterUsername/discordUsername columns').setRequired(true))
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
 ].map(c => c.toJSON());
